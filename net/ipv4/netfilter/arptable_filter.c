@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Filtering ARP tables module.
  *
@@ -79,6 +80,12 @@ static int __init arptable_filter_init(void)
 	if (ret < 0) {
 		kfree(arpfilter_ops);
 		return ret;
+	}
+
+	ret = arptable_filter_table_init(&init_net);
+	if (ret) {
+		unregister_pernet_subsys(&arptable_filter_net_ops);
+		kfree(arpfilter_ops);
 	}
 
 	return ret;

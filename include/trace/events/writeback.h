@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM writeback
 
@@ -31,7 +32,7 @@
 
 #define WB_WORK_REASON							\
 	EM( WB_REASON_BACKGROUND,		"background")		\
-	EM( WB_REASON_TRY_TO_FREE_PAGES,	"try_to_free_pages")	\
+	EM( WB_REASON_VMSCAN,			"vmscan")		\
 	EM( WB_REASON_SYNC,			"sync")			\
 	EM( WB_REASON_PERIODIC,			"periodic")		\
 	EM( WB_REASON_LAPTOP_TIMER,		"laptop_timer")		\
@@ -52,7 +53,7 @@ WB_WORK_REASON
 
 struct wb_writeback_work;
 
-TRACE_EVENT(writeback_dirty_page,
+DECLARE_EVENT_CLASS(writeback_page_template,
 
 	TP_PROTO(struct page *page, struct address_space *mapping),
 
@@ -76,6 +77,20 @@ TRACE_EVENT(writeback_dirty_page,
 		__entry->ino,
 		__entry->index
 	)
+);
+
+DEFINE_EVENT(writeback_page_template, writeback_dirty_page,
+
+	TP_PROTO(struct page *page, struct address_space *mapping),
+
+	TP_ARGS(page, mapping)
+);
+
+DEFINE_EVENT(writeback_page_template, wait_on_page_writeback,
+
+	TP_PROTO(struct page *page, struct address_space *mapping),
+
+	TP_ARGS(page, mapping)
 );
 
 DECLARE_EVENT_CLASS(writeback_dirty_inode_template,
@@ -136,7 +151,7 @@ DEFINE_EVENT(writeback_dirty_inode_template, writeback_dirty_inode,
 
 static inline unsigned int __trace_wb_assign_cgroup(struct bdi_writeback *wb)
 {
-	return wb->memcg_css->cgroup->kn->ino;
+	return wb->memcg_css->cgroup->kn->id.ino;
 }
 
 static inline unsigned int __trace_wbc_assign_cgroup(struct writeback_control *wbc)
@@ -160,6 +175,132 @@ static inline unsigned int __trace_wbc_assign_cgroup(struct writeback_control *w
 
 #endif	/* CONFIG_CGROUP_WRITEBACK */
 #endif	/* CREATE_TRACE_POINTS */
+
+#ifdef CONFIG_CGROUP_WRITEBACK
+TRACE_EVENT(inode_foreign_history,
+
+	TP_PROTO(struct inode *inode, struct writeback_control *wbc,
+		 unsigned int history),
+
+	TP_ARGS(inode, wbc, history),
+
+	TP_STRUCT__entry(
+		__array(char,		name, 32)
+		__field(unsigned long,	ino)
+		__field(unsigned int,	cgroup_ino)
+		__field(unsigned int,	history)
+	),
+
+	TP_fast_assign(
+		strncpy(__entry->name, dev_name(inode_to_bdi(inode)->dev), 32);
+		__entry->ino		= inode->i_ino;
+		__entry->cgroup_ino	= __trace_wbc_assign_cgroup(wbc);
+		__entry->history	= history;
+	),
+
+	TP_printk("bdi %s: ino=%lu cgroup_ino=%u history=0x%x",
+		__entry->name,
+		__entry->ino,
+		__entry->cgroup_ino,
+		__entry->history
+	)
+);
+
+TRACE_EVENT(inode_switch_wbs,
+
+	TP_PROTO(struct inode *inode, struct bdi_writeback *old_wb,
+		 struct bdi_writeback *new_wb),
+
+	TP_ARGS(inode, old_wb, new_wb),
+
+	TP_STRUCT__entry(
+		__array(char,		name, 32)
+		__field(unsigned long,	ino)
+		__field(unsigned int,	old_cgroup_ino)
+		__field(unsigned int,	new_cgroup_ino)
+	),
+
+	TP_fast_assign(
+		strncpy(__entry->name,	dev_name(old_wb->bdi->dev), 32);
+		__entry->ino		= inode->i_ino;
+		__entry->old_cgroup_ino	= __trace_wb_assign_cgroup(old_wb);
+		__entry->new_cgroup_ino	= __trace_wb_assign_cgroup(new_wb);
+	),
+
+	TP_printk("bdi %s: ino=%lu old_cgroup_ino=%u new_cgroup_ino=%u",
+		__entry->name,
+		__entry->ino,
+		__entry->old_cgroup_ino,
+		__entry->new_cgroup_ino
+	)
+);
+
+TRACE_EVENT(track_foreign_dirty,
+
+	TP_PROTO(struct page *page, struct bdi_writeback *wb),
+
+	TP_ARGS(page, wb),
+
+	TP_STRUCT__entry(
+		__array(char,		name, 32)
+		__field(u64,		bdi_id)
+		__field(unsigned long,	ino)
+		__field(unsigned int,	memcg_id)
+		__field(unsigned int,	cgroup_ino)
+		__field(unsigned int,	page_cgroup_ino)
+	),
+
+	TP_fast_assign(
+		struct address_space *mapping = page_mapping(page);
+		struct inode *inode = mapping ? mapping->host : NULL;
+
+		strncpy(__entry->name,	dev_name(wb->bdi->dev), 32);
+		__entry->bdi_id		= wb->bdi->id;
+		__entry->ino		= inode ? inode->i_ino : 0;
+		__entry->memcg_id	= wb->memcg_css->id;
+		__entry->cgroup_ino	= __trace_wb_assign_cgroup(wb);
+		__entry->page_cgroup_ino = page->mem_cgroup->css.cgroup->kn->id.ino;
+	),
+
+	TP_printk("bdi %s[%llu]: ino=%lu memcg_id=%u cgroup_ino=%u page_cgroup_ino=%u",
+		__entry->name,
+		__entry->bdi_id,
+		__entry->ino,
+		__entry->memcg_id,
+		__entry->cgroup_ino,
+		__entry->page_cgroup_ino
+	)
+);
+
+TRACE_EVENT(flush_foreign,
+
+	TP_PROTO(struct bdi_writeback *wb, unsigned int frn_bdi_id,
+		 unsigned int frn_memcg_id),
+
+	TP_ARGS(wb, frn_bdi_id, frn_memcg_id),
+
+	TP_STRUCT__entry(
+		__array(char,		name, 32)
+		__field(unsigned int,	cgroup_ino)
+		__field(unsigned int,	frn_bdi_id)
+		__field(unsigned int,	frn_memcg_id)
+	),
+
+	TP_fast_assign(
+		strncpy(__entry->name,	dev_name(wb->bdi->dev), 32);
+		__entry->cgroup_ino	= __trace_wb_assign_cgroup(wb);
+		__entry->frn_bdi_id	= frn_bdi_id;
+		__entry->frn_memcg_id	= frn_memcg_id;
+	),
+
+	TP_printk("bdi %s: cgroup_ino=%u frn_bdi_id=%u frn_memcg_id=%u",
+		__entry->name,
+		__entry->cgroup_ino,
+		__entry->frn_bdi_id,
+		__entry->frn_memcg_id
+	)
+);
+#endif
 
 DECLARE_EVENT_CLASS(writeback_write_inode_template,
 
@@ -286,7 +427,6 @@ DEFINE_EVENT(writeback_class, name, \
 	TP_PROTO(struct bdi_writeback *wb), \
 	TP_ARGS(wb))
 
-DEFINE_WRITEBACK_EVENT(writeback_nowork);
 DEFINE_WRITEBACK_EVENT(writeback_wake_background);
 
 TRACE_EVENT(writeback_bdi_register,
@@ -412,11 +552,11 @@ TRACE_EVENT(global_dirty_state,
 	),
 
 	TP_fast_assign(
-		__entry->nr_dirty	= global_page_state(NR_FILE_DIRTY);
-		__entry->nr_writeback	= global_page_state(NR_WRITEBACK);
-		__entry->nr_unstable	= global_page_state(NR_UNSTABLE_NFS);
-		__entry->nr_dirtied	= global_page_state(NR_DIRTIED);
-		__entry->nr_written	= global_page_state(NR_WRITTEN);
+		__entry->nr_dirty	= global_node_page_state(NR_FILE_DIRTY);
+		__entry->nr_writeback	= global_node_page_state(NR_WRITEBACK);
+		__entry->nr_unstable	= global_node_page_state(NR_UNSTABLE_NFS);
+		__entry->nr_dirtied	= global_node_page_state(NR_DIRTIED);
+		__entry->nr_written	= global_node_page_state(NR_WRITTEN);
 		__entry->background_thresh = background_thresh;
 		__entry->dirty_thresh	= dirty_thresh;
 		__entry->dirty_limit	= global_wb_domain.dirty_limit;
@@ -696,7 +836,7 @@ DEFINE_EVENT(writeback_single_inode_template, writeback_single_inode,
 	TP_ARGS(inode, wbc, nr_to_write)
 );
 
-DECLARE_EVENT_CLASS(writeback_lazytime_template,
+DECLARE_EVENT_CLASS(writeback_inode_template,
 	TP_PROTO(struct inode *inode),
 
 	TP_ARGS(inode),
@@ -723,22 +863,36 @@ DECLARE_EVENT_CLASS(writeback_lazytime_template,
 		  show_inode_state(__entry->state), __entry->mode)
 );
 
-DEFINE_EVENT(writeback_lazytime_template, writeback_lazytime,
+DEFINE_EVENT(writeback_inode_template, writeback_lazytime,
 	TP_PROTO(struct inode *inode),
 
 	TP_ARGS(inode)
 );
 
-DEFINE_EVENT(writeback_lazytime_template, writeback_lazytime_iput,
+DEFINE_EVENT(writeback_inode_template, writeback_lazytime_iput,
 	TP_PROTO(struct inode *inode),
 
 	TP_ARGS(inode)
 );
 
-DEFINE_EVENT(writeback_lazytime_template, writeback_dirty_inode_enqueue,
+DEFINE_EVENT(writeback_inode_template, writeback_dirty_inode_enqueue,
 
 	TP_PROTO(struct inode *inode),
 
+	TP_ARGS(inode)
+);
+
+/*
+ * Inode writeback list tracking.
+ */
+
+DEFINE_EVENT(writeback_inode_template, sb_mark_inode_writeback,
+	TP_PROTO(struct inode *inode),
+	TP_ARGS(inode)
+);
+
+DEFINE_EVENT(writeback_inode_template, sb_clear_inode_writeback,
+	TP_PROTO(struct inode *inode),
 	TP_ARGS(inode)
 );
 

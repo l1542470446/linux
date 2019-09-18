@@ -1,24 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Ultra Wide Band
  * AES-128 CCM Encryption
  *
  * Copyright (C) 2007 Intel Corporation
  * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
  *
  * We don't do any encryption here; we use the Linux Kernel's AES-128
  * crypto modules to construct keys and payload blocks in a way
@@ -45,6 +31,9 @@
  *             funneled through AES are...16 bytes in size!
  */
 
+#include <crypto/aes.h>
+#include <crypto/algapi.h>
+#include <crypto/hash.h>
 #include <crypto/skcipher.h>
 #include <linux/crypto.h>
 #include <linux/module.h>
@@ -54,7 +43,7 @@
 #include <linux/usb/wusb.h>
 #include <linux/scatterlist.h>
 
-static int debug_crypto_verify = 0;
+static int debug_crypto_verify;
 
 module_param(debug_crypto_verify, int, 0);
 MODULE_PARM_DESC(debug_crypto_verify, "verify the key generation algorithms");
@@ -123,15 +112,12 @@ struct aes_ccm_a {
 	__be16 counter;	/* Value of x */
 } __attribute__((packed));
 
-static void bytewise_xor(void *_bo, const void *_bi1, const void *_bi2,
-			 size_t size)
-{
-	u8 *bo = _bo;
-	const u8 *bi1 = _bi1, *bi2 = _bi2;
-	size_t itr;
-	for (itr = 0; itr < size; itr++)
-		bo[itr] = bi1[itr] ^ bi2[itr];
-}
+/* Scratch space for MAC calculations. */
+struct wusb_mac_scratch {
+	struct aes_ccm_b0 b0;
+	struct aes_ccm_b1 b1;
+	struct aes_ccm_a ax;
+};
 
 /*
  * CC-MAC function WUSB1.0[6.5]
@@ -157,8 +143,7 @@ static void bytewise_xor(void *_bo, const void *_bi1, const void *_bi2,
  * @a: ASCII string, 14 bytes long (I guess zero padded if needed;
  *     we use exactly 14 bytes).
  *
- * @b: data stream to be processed; cannot be a global or const local
- *     (will confuse the scatterlists)
+ * @b: data stream to be processed
  *
  * @blen: size of b...
  *
@@ -167,15 +152,9 @@ static void bytewise_xor(void *_bo, const void *_bi1, const void *_bi2,
  * @key. We bytewise xor B0 with B1 (1) and AES-crypt that. Then we
  * take the payload and divide it in blocks (16 bytes), xor them with
  * the previous crypto result (16 bytes) and crypt it, repeat the next
- * block with the output of the previous one, rinse wash (I guess this
- * is what AES CBC mode means...but I truly have no idea). So we use
- * the CBC(AES) blkcipher, that does precisely that. The IV (Initial
+ * block with the output of the previous one, rinse wash. So we use
+ * the CBC-MAC(AES) shash, that does precisely that. The IV (Initial
  * Vector) is 16 bytes and is set to zero, so
- *
- * See rfc3610. Linux crypto has a CBC implementation, but the
- * documentation is scarce, to say the least, and the example code is
- * so intricated that is difficult to understand how things work. Most
- * of this is guess work -- bite me.
  *
  * (1) Created as 6.5 says, again, using as l(a) 'Blen + 14', and
  *     using the 14 bytes of @a to fill up
@@ -196,50 +175,29 @@ static void bytewise_xor(void *_bo, const void *_bi1, const void *_bi2,
  * NOTE: blen is not aligned to a block size, we'll pad zeros, that's
  *       what sg[4] is for. Maybe there is a smarter way to do this.
  */
-static int wusb_ccm_mac(struct crypto_skcipher *tfm_cbc,
-			struct crypto_cipher *tfm_aes, void *mic,
+static int wusb_ccm_mac(struct crypto_shash *tfm_cbcmac,
+			struct wusb_mac_scratch *scratch,
+			void *mic,
 			const struct aes_ccm_nonce *n,
 			const struct aes_ccm_label *a, const void *b,
 			size_t blen)
 {
-	int result = 0;
-	SKCIPHER_REQUEST_ON_STACK(req, tfm_cbc);
-	struct aes_ccm_b0 b0;
-	struct aes_ccm_b1 b1;
-	struct aes_ccm_a ax;
-	struct scatterlist sg[4], sg_dst;
-	void *dst_buf;
-	size_t dst_size;
-	const u8 bzero[16] = { 0 };
-	u8 iv[crypto_skcipher_ivsize(tfm_cbc)];
-	size_t zero_padding;
+	SHASH_DESC_ON_STACK(desc, tfm_cbcmac);
+	u8 iv[AES_BLOCK_SIZE];
 
 	/*
 	 * These checks should be compile time optimized out
 	 * ensure @a fills b1's mac_header and following fields
 	 */
-	WARN_ON(sizeof(*a) != sizeof(b1) - sizeof(b1.la));
-	WARN_ON(sizeof(b0) != sizeof(struct aes_ccm_block));
-	WARN_ON(sizeof(b1) != sizeof(struct aes_ccm_block));
-	WARN_ON(sizeof(ax) != sizeof(struct aes_ccm_block));
-
-	result = -ENOMEM;
-	zero_padding = blen % sizeof(struct aes_ccm_block);
-	if (zero_padding)
-		zero_padding = sizeof(struct aes_ccm_block) - zero_padding;
-	dst_size = blen + sizeof(b0) + sizeof(b1) + zero_padding;
-	dst_buf = kzalloc(dst_size, GFP_KERNEL);
-	if (dst_buf == NULL) {
-		printk(KERN_ERR "E: can't alloc destination buffer\n");
-		goto error_dst_buf;
-	}
-
-	memset(iv, 0, sizeof(iv));
+	BUILD_BUG_ON(sizeof(*a) != sizeof(scratch->b1) - sizeof(scratch->b1.la));
+	BUILD_BUG_ON(sizeof(scratch->b0) != sizeof(struct aes_ccm_block));
+	BUILD_BUG_ON(sizeof(scratch->b1) != sizeof(struct aes_ccm_block));
+	BUILD_BUG_ON(sizeof(scratch->ax) != sizeof(struct aes_ccm_block));
 
 	/* Setup B0 */
-	b0.flags = 0x59;	/* Format B0 */
-	b0.ccm_nonce = *n;
-	b0.lm = cpu_to_be16(0);	/* WUSB1.0[6.5] sez l(m) is 0 */
+	scratch->b0.flags = 0x59;	/* Format B0 */
+	scratch->b0.ccm_nonce = *n;
+	scratch->b0.lm = cpu_to_be16(0);	/* WUSB1.0[6.5] sez l(m) is 0 */
 
 	/* Setup B1
 	 *
@@ -248,46 +206,31 @@ static int wusb_ccm_mac(struct crypto_skcipher *tfm_cbc,
 	 * 14'--after clarification, it means to use A's contents
 	 * for MAC Header, EO, sec reserved and padding.
 	 */
-	b1.la = cpu_to_be16(blen + 14);
-	memcpy(&b1.mac_header, a, sizeof(*a));
+	scratch->b1.la = cpu_to_be16(blen + 14);
+	memcpy(&scratch->b1.mac_header, a, sizeof(*a));
 
-	sg_init_table(sg, ARRAY_SIZE(sg));
-	sg_set_buf(&sg[0], &b0, sizeof(b0));
-	sg_set_buf(&sg[1], &b1, sizeof(b1));
-	sg_set_buf(&sg[2], b, blen);
-	/* 0 if well behaved :) */
-	sg_set_buf(&sg[3], bzero, zero_padding);
-	sg_init_one(&sg_dst, dst_buf, dst_size);
-
-	skcipher_request_set_tfm(req, tfm_cbc);
-	skcipher_request_set_callback(req, 0, NULL, NULL);
-	skcipher_request_set_crypt(req, sg, &sg_dst, dst_size, iv);
-	result = crypto_skcipher_encrypt(req);
-	skcipher_request_zero(req);
-	if (result < 0) {
-		printk(KERN_ERR "E: can't compute CBC-MAC tag (MIC): %d\n",
-		       result);
-		goto error_cbc_crypt;
-	}
+	desc->tfm = tfm_cbcmac;
+	crypto_shash_init(desc);
+	crypto_shash_update(desc, (u8 *)&scratch->b0, sizeof(scratch->b0) +
+						      sizeof(scratch->b1));
+	crypto_shash_finup(desc, b, blen, iv);
 
 	/* Now we crypt the MIC Tag (*iv) with Ax -- values per WUSB1.0[6.5]
 	 * The procedure is to AES crypt the A0 block and XOR the MIC
 	 * Tag against it; we only do the first 8 bytes and place it
 	 * directly in the destination buffer.
-	 *
-	 * POS Crypto API: size is assumed to be AES's block size.
-	 * Thanks for documenting it -- tip taken from airo.c
 	 */
-	ax.flags = 0x01;		/* as per WUSB 1.0 spec */
-	ax.ccm_nonce = *n;
-	ax.counter = 0;
-	crypto_cipher_encrypt_one(tfm_aes, (void *)&ax, (void *)&ax);
-	bytewise_xor(mic, &ax, iv, 8);
-	result = 8;
-error_cbc_crypt:
-	kfree(dst_buf);
-error_dst_buf:
-	return result;
+	scratch->ax.flags = 0x01;		/* as per WUSB 1.0 spec */
+	scratch->ax.ccm_nonce = *n;
+	scratch->ax.counter = 0;
+
+	/* reuse the CBC-MAC transform to perform the single block encryption */
+	crypto_shash_digest(desc, (u8 *)&scratch->ax, sizeof(scratch->ax),
+			    (u8 *)&scratch->ax);
+
+	crypto_xor_cpy(mic, (u8 *)&scratch->ax, iv, 8);
+
+	return 8;
 }
 
 /*
@@ -303,52 +246,39 @@ ssize_t wusb_prf(void *out, size_t out_size,
 {
 	ssize_t result, bytes = 0, bitr;
 	struct aes_ccm_nonce n = *_n;
-	struct crypto_skcipher *tfm_cbc;
-	struct crypto_cipher *tfm_aes;
+	struct crypto_shash *tfm_cbcmac;
+	struct wusb_mac_scratch scratch;
 	u64 sfn = 0;
 	__le64 sfn_le;
 
-	tfm_cbc = crypto_alloc_skcipher("cbc(aes)", 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm_cbc)) {
-		result = PTR_ERR(tfm_cbc);
-		printk(KERN_ERR "E: can't load CBC(AES): %d\n", (int)result);
-		goto error_alloc_cbc;
-	}
-	result = crypto_skcipher_setkey(tfm_cbc, key, 16);
-	if (result < 0) {
-		printk(KERN_ERR "E: can't set CBC key: %d\n", (int)result);
-		goto error_setkey_cbc;
+	tfm_cbcmac = crypto_alloc_shash("cbcmac(aes)", 0, 0);
+	if (IS_ERR(tfm_cbcmac)) {
+		result = PTR_ERR(tfm_cbcmac);
+		printk(KERN_ERR "E: can't load CBCMAC-AES: %d\n", (int)result);
+		goto error_alloc_cbcmac;
 	}
 
-	tfm_aes = crypto_alloc_cipher("aes", 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm_aes)) {
-		result = PTR_ERR(tfm_aes);
-		printk(KERN_ERR "E: can't load AES: %d\n", (int)result);
-		goto error_alloc_aes;
-	}
-	result = crypto_cipher_setkey(tfm_aes, key, 16);
+	result = crypto_shash_setkey(tfm_cbcmac, key, AES_BLOCK_SIZE);
 	if (result < 0) {
-		printk(KERN_ERR "E: can't set AES key: %d\n", (int)result);
-		goto error_setkey_aes;
+		printk(KERN_ERR "E: can't set CBCMAC-AES key: %d\n", (int)result);
+		goto error_setkey_cbcmac;
 	}
 
 	for (bitr = 0; bitr < (len + 63) / 64; bitr++) {
 		sfn_le = cpu_to_le64(sfn++);
 		memcpy(&n.sfn, &sfn_le, sizeof(n.sfn));	/* n.sfn++... */
-		result = wusb_ccm_mac(tfm_cbc, tfm_aes, out + bytes,
+		result = wusb_ccm_mac(tfm_cbcmac, &scratch, out + bytes,
 				      &n, a, b, blen);
 		if (result < 0)
 			goto error_ccm_mac;
 		bytes += result;
 	}
 	result = bytes;
+
 error_ccm_mac:
-error_setkey_aes:
-	crypto_free_cipher(tfm_aes);
-error_alloc_aes:
-error_setkey_cbc:
-	crypto_free_skcipher(tfm_cbc);
-error_alloc_cbc:
+error_setkey_cbcmac:
+	crypto_free_shash(tfm_cbcmac);
+error_alloc_cbcmac:
 	return result;
 }
 
@@ -373,12 +303,8 @@ static int wusb_oob_mic_verify(void)
 {
 	int result;
 	u8 mic[8];
-	/* WUSB1.0[A.2] test vectors
-	 *
-	 * Need to keep it in the local stack as GCC 4.1.3something
-	 * messes up and generates noise.
-	 */
-	struct usb_handshake stv_hsmic_hs = {
+	/* WUSB1.0[A.2] test vectors */
+	static const struct usb_handshake stv_hsmic_hs = {
 		.bMessageNumber = 2,
 		.bStatus 	= 00,
 		.tTKID 		= { 0x76, 0x98, 0x01 },
@@ -390,7 +316,7 @@ static int wusb_oob_mic_verify(void)
 				    0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b,
 				    0x2c, 0x2d, 0x2e, 0x2f },
 		.MIC	 	= { 0x75, 0x6a, 0x97, 0x51, 0x0c, 0x8c,
-				    0x14, 0x7b } ,
+				    0x14, 0x7b },
 	};
 	size_t hs_size;
 
@@ -453,11 +379,8 @@ static int wusb_key_derive_verify(void)
 {
 	int result = 0;
 	struct wusb_keydvt_out keydvt_out;
-	/* These come from WUSB1.0[A.1] + 2006/12 errata
-	 * NOTE: can't make this const or global -- somehow it seems
-	 *       the scatterlists for crypto get confused and we get
-	 *       bad data. There is no doc on this... */
-	struct wusb_keydvt_in stv_keydvt_in_a1 = {
+	/* These come from WUSB1.0[A.1] + 2006/12 errata */
+	static const struct wusb_keydvt_in stv_keydvt_in_a1 = {
 		.hnonce = {
 			0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
 			0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
@@ -480,7 +403,7 @@ static int wusb_key_derive_verify(void)
 		printk(KERN_ERR "E: keydvt in: key\n");
 		wusb_key_dump(stv_key_a1, sizeof(stv_key_a1));
 		printk(KERN_ERR "E: keydvt in: nonce\n");
-		wusb_key_dump( &stv_keydvt_n_a1, sizeof(stv_keydvt_n_a1));
+		wusb_key_dump(&stv_keydvt_n_a1, sizeof(stv_keydvt_n_a1));
 		printk(KERN_ERR "E: keydvt in: hnonce & dnonce\n");
 		wusb_key_dump(&stv_keydvt_in_a1, sizeof(stv_keydvt_in_a1));
 		printk(KERN_ERR "E: keydvt out: KCK\n");

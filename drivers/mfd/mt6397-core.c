@@ -1,15 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2014 MediaTek Inc.
  * Author: Flora Fu, MediaTek
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/interrupt.h>
@@ -43,10 +35,28 @@ static const struct resource mt6397_rtc_resources[] = {
 	},
 };
 
+static const struct resource mt6323_keys_resources[] = {
+	DEFINE_RES_IRQ(MT6323_IRQ_STATUS_PWRKEY),
+	DEFINE_RES_IRQ(MT6323_IRQ_STATUS_FCHRKEY),
+};
+
+static const struct resource mt6397_keys_resources[] = {
+	DEFINE_RES_IRQ(MT6397_IRQ_PWRKEY),
+	DEFINE_RES_IRQ(MT6397_IRQ_HOMEKEY),
+};
+
 static const struct mfd_cell mt6323_devs[] = {
 	{
 		.name = "mt6323-regulator",
 		.of_compatible = "mediatek,mt6323-regulator"
+	}, {
+		.name = "mt6323-led",
+		.of_compatible = "mediatek,mt6323-led"
+	}, {
+		.name = "mtk-pmic-keys",
+		.num_resources = ARRAY_SIZE(mt6323_keys_resources),
+		.resources = mt6323_keys_resources,
+		.of_compatible = "mediatek,mt6323-keys"
 	},
 };
 
@@ -68,7 +78,12 @@ static const struct mfd_cell mt6397_devs[] = {
 	}, {
 		.name = "mt6397-pinctrl",
 		.of_compatible = "mediatek,mt6397-pinctrl",
-	},
+	}, {
+		.name = "mtk-pmic-keys",
+		.num_resources = ARRAY_SIZE(mt6397_keys_resources),
+		.resources = mt6397_keys_resources,
+		.of_compatible = "mediatek,mt6397-keys"
+	}
 };
 
 static void mt6397_irq_lock(struct irq_data *data)
@@ -267,8 +282,12 @@ static int mt6397_probe(struct platform_device *pdev)
 	ret = regmap_read(pmic->regmap, MT6397_CID, &id);
 	if (ret) {
 		dev_err(pmic->dev, "Failed to read chip id: %d\n", ret);
-		goto fail_irq;
+		return ret;
 	}
+
+	pmic->irq = platform_get_irq(pdev, 0);
+	if (pmic->irq <= 0)
+		return pmic->irq;
 
 	switch (id & 0xff) {
 	case MT6323_CID_CODE:
@@ -276,8 +295,13 @@ static int mt6397_probe(struct platform_device *pdev)
 		pmic->int_con[1] = MT6323_INT_CON1;
 		pmic->int_status[0] = MT6323_INT_STATUS0;
 		pmic->int_status[1] = MT6323_INT_STATUS1;
-		ret = mfd_add_devices(&pdev->dev, -1, mt6323_devs,
-				ARRAY_SIZE(mt6323_devs), NULL, 0, NULL);
+		ret = mt6397_irq_init(pmic);
+		if (ret)
+			return ret;
+
+		ret = devm_mfd_add_devices(&pdev->dev, -1, mt6323_devs,
+					   ARRAY_SIZE(mt6323_devs), NULL,
+					   0, pmic->irq_domain);
 		break;
 
 	case MT6397_CID_CODE:
@@ -286,37 +310,26 @@ static int mt6397_probe(struct platform_device *pdev)
 		pmic->int_con[1] = MT6397_INT_CON1;
 		pmic->int_status[0] = MT6397_INT_STATUS0;
 		pmic->int_status[1] = MT6397_INT_STATUS1;
-		ret = mfd_add_devices(&pdev->dev, -1, mt6397_devs,
-				ARRAY_SIZE(mt6397_devs), NULL, 0, NULL);
+		ret = mt6397_irq_init(pmic);
+		if (ret)
+			return ret;
+
+		ret = devm_mfd_add_devices(&pdev->dev, -1, mt6397_devs,
+					   ARRAY_SIZE(mt6397_devs), NULL,
+					   0, pmic->irq_domain);
 		break;
 
 	default:
 		dev_err(&pdev->dev, "unsupported chip: %d\n", id);
-		ret = -ENODEV;
-		break;
+		return -ENODEV;
 	}
 
-	pmic->irq = platform_get_irq(pdev, 0);
-	if (pmic->irq > 0) {
-		ret = mt6397_irq_init(pmic);
-		if (ret)
-			return ret;
-	}
-
-fail_irq:
 	if (ret) {
 		irq_domain_remove(pmic->irq_domain);
 		dev_err(&pdev->dev, "failed to add child devices: %d\n", ret);
 	}
 
 	return ret;
-}
-
-static int mt6397_remove(struct platform_device *pdev)
-{
-	mfd_remove_devices(&pdev->dev);
-
-	return 0;
 }
 
 static const struct of_device_id mt6397_of_match[] = {
@@ -334,7 +347,6 @@ MODULE_DEVICE_TABLE(platform, mt6397_id);
 
 static struct platform_driver mt6397_driver = {
 	.probe = mt6397_probe,
-	.remove = mt6397_remove,
 	.driver = {
 		.name = "mt6397",
 		.of_match_table = of_match_ptr(mt6397_of_match),
